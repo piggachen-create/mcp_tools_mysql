@@ -1,27 +1,29 @@
 # MySQL MCP Tool
 
-面向 MySQL 的 [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) 服务。本服务通过 MCP 协议，让 AI 客户端以统一、受控的方式探查 MySQL 数据库结构并执行只读查询；仅在显式开启时开放受控写入。
+面向 MySQL 的 [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) 服务。本服务通过 MCP 协议，让 AI 客户端以统一、受控的方式探查 MySQL 数据库结构并执行只读查询；写入能力按数据源显式开启。
 
-> **当前状态：M4 已完成（发布准备）**
-> M1 交付 stdio 协议骨架与配置 fail-fast；M2 交付连接池、元数据三工具、`mysql_query` 只读查询（AST 白名单分类 + 参数化 + 限行限超时）、序列化与错误映射；M3 交付 `mysql_execute` 受控写入（条件注册 + AST 写入白名单 + 事务化执行 + 影响行数超限自动回滚）；M4 完成打包脚本、快速开始实化、示例授权脚本与文档定稿。
+> **当前状态：多数据源版已发布（M4 里程碑完成）**
+> 配置由单个 JSON 文件（`MCP_SOURCES_FILE`）声明**多数据源**（含 `global` 全局默认 `+ sources` 每源覆盖合并）；`ConnectionManager` 按 target 懒建并复用每源连接池；5 个工具恒定注册，`mysql_execute` 按目标数据源 `allowWrite` 判定可用性。已完成 typecheck 与全部单元测试（249/249）。
 
 ## 项目定位
 
-- **能力**：通过 MCP 工具向 AI 客户端提供 MySQL 元数据读取（库/表/结构）与受控的多数据库查询能力；可选地开放受限写入。
+- **能力**：通过 MCP 工具向 AI 客户端提供 MySQL 元数据读取（库/表/结构）与受控的多数据库查询能力；各数据源可独立开启受限写入。
 - **技术栈**：Node.js + TypeScript，官方 MCP TypeScript SDK，`mysql2/promise` 驱动。
 - **传输方式**：首版仅支持 `stdio` transport，不设计 HTTP/SSE、多租户或管理后台。
-- **默认只读**：默认模式下不注册任何写入工具。只有在启动配置显式开启写入开关后，才注册受控的 `mysql_execute` 工具。
+- **多数据源与按源开关**：一个进程通过 `mcp.sources.json` 声明多个数据源（各以 `target` 标识）；写入能力按**每数据源** `allowWrite` 独立控制，未开启的数据源调用 `mysql_execute` 返回 `WRITE_DISABLED`。
 - **安全边界**：SQL 应用层策略只是纵深防御的第一道；**MySQL 账号权限才是最终安全边界**。服务要求使用低权限数据库账号运行。
 
 ## 首版能力
 
 | 工具 | 说明 | 默认注册 |
 | --- | --- | --- |
-| `mysql_list_databases` | 列出当前账号可见的数据库 | ✅ |
+| `mysql_list_databases` | 列出指定数据源（缺省默认源）账号可见的数据库 | ✅ |
 | `mysql_list_tables` | 列出指定 Schema 下的表与视图 | ✅ |
 | `mysql_describe_table` | 描述单张表/视图的字段结构 | ✅ |
 | `mysql_query` | 执行只读查询（参数化，限行数、限超时） | ✅ |
-| `mysql_execute` | 在事务中执行受控 DML（仅 `INSERT`、带 `WHERE` 的 `UPDATE`/`DELETE`） | ⛔ 仅开启写入后 |
+| `mysql_execute` | 在事务中执行受控 DML（仅 `INSERT`、带 `WHERE` 的 `UPDATE`/`DELETE`）；按目标源 `allowWrite` 判定 | ✅ |
+
+所有工具输入均含可选 `target` 字段：指定数据源标识，缺省落到默认源（`defaultTarget`，缺省取首 source）。
 
 ## 非目标（首版明确不做）
 
@@ -60,28 +62,82 @@ npm run build      # 编译到 dist/（typecheck + 单测：npm run typecheck / 
 
 服务要求使用低权限账号运行（数据库权限是最终安全边界）：
 
-- 只读模式（默认）：执行 [examples/grant-ro.sql](examples/grant-ro.sql)
-- 受控写入模式：执行 [examples/grant-rw.sql](examples/grant-rw.sql)，并配合 `MYSQL_ALLOW_WRITE=true`
+- 只读数据源（`allowWrite=false`）：执行 [examples/grant-ro.sql](examples/grant-ro.sql)
+- 写入数据源（对应 `allowWrite=true`）：执行 [examples/grant-rw.sql](examples/grant-rw.sql)
 
-### 3. 配置环境变量
+### 3. 编写多数据源配置（mcp.sources.json）
+
+配置由单个 JSON 文件声明，路径由环境变量 `MCP_SOURCES_FILE` 指定（缺省 `./mcp.sources.json`）。顶层结构：`{ global?, defaultTarget?, sources: [...] }`。
+
+参考 [examples/mcp.sources.json](examples/mcp.sources.json) 的多源示例：
+
+```json
+{
+  "global": {
+    "poolSize": 5,
+    "poolIdleTimeoutMs": 60000,
+    "queryTimeoutMs": 30000,
+    "maxRows": 1000,
+    "sqlMaxLength": 16384,
+    "maxParams": 500,
+    "maxAffectedRows": 1000,
+    "tls": false,
+    "tlsRejectUnauthorized": true,
+    "allowWrite": false,
+    "logLevel": "info"
+  },
+  "defaultTarget": "app",
+  "sources": [
+    {
+      "target": "app",
+      "host": "127.0.0.1",
+      "port": 3306,
+      "user": "mysql_mcp_ro",
+      "password": "${MYSQL_PASSWORD}",
+      "database": "app"
+    },
+    {
+      "target": "replica",
+      "host": "replica.internal",
+      "user": "mysql_mcp_ro",
+      "password": "${MYSQL_REPLICA_PASSWORD}",
+      "database": "analytics",
+      "maxRows": 2000,
+      "queryTimeoutMs": 20000
+    },
+    {
+      "target": "write-pool",
+      "host": "127.0.0.1",
+      "user": "mysql_mcp_rw",
+      "password": "${MYSQL_WRITE_PASSWORD}",
+      "database": "app",
+      "allowWrite": true,
+      "maxAffectedRows": 500
+    }
+  ]
+}
+```
+
+**配置要点**
+
+- **环境变量表**：
 
 | 环境变量 | 必填 | 默认值 | 说明 |
 | --- | --- | --- | --- |
-| `MYSQL_HOST` | ✅ | 无 | 主机名/IPv4/IPv6 |
-| `MYSQL_USER` | ✅ | 无 | 数据库账号（建议 `mysql_mcp_ro`） |
-| `MYSQL_PASSWORD` | ✅ | 无 | **禁止出现在任何日志中** |
-| `MYSQL_PORT` | 否 | `3306` | 1–65535 |
-| `MYSQL_DATABASE` | 否 | 空 | 账号默认库 |
-| `MYSQL_ALLOW_WRITE` | 否 | `false` | 仅接受 `true`/`false`；开启后注册 `mysql_execute` |
-| `MYSQL_MAX_ROWS` | 否 | `1000` | 单次查询最大返回行数 |
-| `MYSQL_QUERY_TIMEOUT_MS` | 否 | `30000` | 查询超时上限（100–300000） |
-| `MYSQL_MAX_AFFECTED_ROWS` | 否 | `1000` | 写入影响行数上限，超限自动回滚 |
+| `MCP_SOURCES_FILE` | 否 | `./mcp.sources.json` | 多数据源 JSON 配置文件路径 |
 
-完整配置项（含 TLS、连接池、SQL 长度等）见 [架构文档·配置体系](docs/architecture.md#5-配置体系)。
+- **连接参数**（每 `source` 必填，不得放 `global`）：`target`、`host`、`user`、`password`；可选 `port`(3306)、`database`、`charset`(utf8mb4)。
+- **全局专属字段**（只能放 `global`）：`poolSize`(5)、`poolIdleTimeoutMs`(60000)、`logLevel`(info)。
+- **可覆盖字段**（三层合并 source > global > 内置默认）：`queryTimeoutMs`(30000)、`maxRows`(1000)、`maxAffectedRows`(1000)、`sqlMaxLength`(16384)、`maxParams`(500)、`allowWrite`(false)、`tls`(false)、`tlsRejectUnauthorized`(true)、`connectTimeoutMs`(10000)。
+- **`target` 规则**：非空、1–64 字符、字符集 `[a-zA-Z0-9_-]`、全局唯一；`defaultTarget` 缺省取首 source。
+- **密码 `${VAR}` 引用**：密码字段支持 `${MYSQL_PASSWORD}` 形式引用环境变量，启动时展开；明文仅存内存，**禁止写入任何日志**。
+- 配置非法时服务启动即失败退出（fail-fast），错误仅含配置项名、不含值。
+
+完整配置项说明见 [架构文档·配置体系](docs/architecture.md#5-配置体系)。
 
 ### 4. 接入 MCP 客户端（stdio）
 
-以 Claude Desktop（`claude_desktop_config.json`）或 Cursor（`.cursor/mcp.json`）为例，将服务作为子进程拉起：
+以 Claude Desktop（`claude_desktop_config.json`）或 Cursor（`.cursor/mcp.json`）为例，将服务作为子进程拉起，并通过 `MCP_SOURCES_FILE` 指定配置文件路径：
 
 ```json
 {
@@ -90,18 +146,19 @@ npm run build      # 编译到 dist/（typecheck + 单测：npm run typecheck / 
       "command": "node",
       "args": ["/absolute/path/to/mysql-mcp-tool/dist/index.js"],
       "env": {
-        "MYSQL_HOST": "127.0.0.1",
-        "MYSQL_PORT": "3306",
-        "MYSQL_USER": "mysql_mcp_ro",
+        "MCP_SOURCES_FILE": "/absolute/path/to/mysql-mcp-tool/examples/mcp.sources.json",
         "MYSQL_PASSWORD": "<强密码>",
-        "MYSQL_DATABASE": "app"
+        "MYSQL_REPLICA_PASSWORD": "<副本强密码>",
+        "MYSQL_WRITE_PASSWORD": "<写入账号强密码>"
       }
     }
   }
 }
 ```
 
-如需受控写入，改用可写账号并追加 `"MYSQL_ALLOW_WRITE": "true"`（工具列表中才会出现 `mysql_execute`）。任一配置非法时服务启动即失败退出（fail-fast），错误仅含配置项名、不含值。
+- **`target` 说明**：配置中每个数据源以 `target` 标识；调用任意工具时传入可选 `target` 字段指定目标源，缺省落到 `defaultTarget`（例中为 `app`）。例如 `"target": "write-pool"` 即对该可写源执行受控 DML。
+- 写入可用性按**目标源** `allowWrite` 判定：对未开启写入的源（如 `app`）调用 `mysql_execute` 返回 `WRITE_DISABLED`。
+- 任一配置非法时服务启动即失败退出（fail-fast），错误仅含配置项名、不含值。
 
 ### 5. 打包
 
@@ -122,6 +179,6 @@ npm pack   # prepack 自动 clean + build，产出只含 dist/docs/examples 的�
 - [x] 仓库初始化（Gitee 私有空仓库，`main` 默认分支）
 - [x] M0 设计冻结：四份设计文档评审通过
 - [x] M1 协议骨架 & 配置解析
-- [x] M2 只读能力（元数据 + 查询 + 序列化 + 错误映射）
-- [x] M3 受控写入（条件注册 + 事务化 DML）
+- [x] M2 只读能力（元数据 + 查询 + 序列化 + 错误映射 + 多源 target 分派）
+- [x] M3 受控写入（常注册 + 按源 `allowWrite` 判定 + 事务化 DML）
 - [x] M4 发布准备（打包、README 快速开始、文档定稿）

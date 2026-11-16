@@ -75,11 +75,11 @@ MCP 服务运行在 AI 客户端（如 Claude Desktop、Cursor 等）的子进�
         ──► 结果(列元数据+行+截断标识+耗时) ──► Server ──► 客户端
 ```
 
-以 `mysql_execute` 为例的受控写入链路（仅开启写入后可用）：
+以 `mysql_execute` 为例的受控写入链路（目标源 `allowWrite` 开启时可用）：
 
 ```
 客户端 ──(invoke mysql_execute)──► Server
-        ──► 写入开关检查(未开启→拒绝)
+        ──► 目标源 allowWrite 检查(未开启→WRITE_DISABLED)
         ──► SQL 分类器(AST 分类) ──► 策略判定(仅 INSERT / 带 WHERE 的 UPDATE|DELETE)
         ──► BEGIN ──► 执行 ──► 影响行数 ≤ 上限? ├─ 是 ──► COMMIT
                                               └─ 否 ──► ROLLBACK
