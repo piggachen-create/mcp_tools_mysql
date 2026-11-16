@@ -1,11 +1,12 @@
 /**
- * 只读工具端到端单元测试：真实 McpServer + InMemoryTransport + 假 SqlRunner。
- * 覆盖 docs/testing-and-roadmap.md 第 4 节可单测部分（无外部 MySQL 依赖）。
+ * 工具端到端单元测试：真实 McpServer + InMemoryTransport + 假 SqlRunner/SqlWriter。
+ * 覆盖 docs/testing-and-roadmap.md 第 4 节可单测部分（无外部 MySQL 依赖）；
+ * M3 起新增 mysql_execute 受控写入用例（事务/回滚语义另见 pool-write.test.ts）。
  */
 import { describe, expect, it } from 'vitest';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { ErrorCode } from '../src/errors.js';
+import { ErrorCode, ToolError } from '../src/errors.js';
 import { createServer } from '../src/server.js';
 import type { QueryResult, SqlRunner } from '../src/pool.js';
 import { FakeRunner, makeConfig, silentLogger } from './helpers.js';
@@ -36,6 +37,7 @@ async function withClient(
   const server = createServer({
     config: makeConfig(configOverrides),
     runner,
+    writer: runner,
     logger: silentLogger(),
   });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -311,20 +313,183 @@ describe('mysql_query：策略与执行', () => {
   });
 });
 
-describe('mysql_execute（M3 前占位）', () => {
-  it('allowWrite=true 时返回 INTERNAL 占位错误', async () => {
+describe('mysql_execute：策略与执行', () => {
+  const WRITE_OK: Record<string, unknown> = { sql: 'UPDATE users SET name = ? WHERE id = ?', params: ['x', 1] };
+
+  it('受控写入成功并返回影响行数摘要', async () => {
+    const runner = new FakeRunner(
+      () => result([], []),
+      () => ({ affectedRows: 2, changedRows: 1, insertId: null }),
+    );
+    await withClient(
+      runner,
+      async (client, r) => {
+        const outcome = await callTool(client, 'mysql_execute', WRITE_OK);
+        expect(outcome.isError).toBe(false);
+        expect(outcome.payload['affectedRows']).toBe(2);
+        expect(outcome.payload['changedRows']).toBe(1);
+        expect(outcome.payload['insertId']).toBe(null);
+        expect(typeof outcome.payload['durationMs']).toBe('number');
+        // 事务化执行参数透传：超时用配置默认、上限来自 maxAffectedRows
+        expect(r.writeCalls[0].sql).toBe('UPDATE users SET name = ? WHERE id = ?');
+        expect(r.writeCalls[0].params).toEqual(['x', 1]);
+        expect(r.writeCalls[0].timeoutMs).toBe(30000);
+        expect(r.writeCalls[0].maxAffectedRows).toBe(1000);
+      },
+      { allowWrite: true },
+    );
+  });
+
+  it('INSERT 成功返回自增 insertId', async () => {
+    const runner = new FakeRunner(
+      () => result([], []),
+      () => ({ affectedRows: 1, changedRows: 0, insertId: 42 }),
+    );
+    await withClient(
+      runner,
+      async (client) => {
+        const outcome = await callTool(client, 'mysql_execute', {
+          sql: 'INSERT INTO users (name) VALUES (?)',
+          params: ['alice'],
+        });
+        expect(outcome.isError).toBe(false);
+        expect(outcome.payload).toMatchObject({ affectedRows: 1, insertId: 42 });
+      },
+      { allowWrite: true },
+    );
+  });
+
+  const WRITE_REJECT_CASES = [
+    'DROP TABLE users',
+    'TRUNCATE TABLE users',
+    'UPDATE users SET name = ?',
+    'DELETE FROM users',
+    'INSERT INTO users VALUES (?)',
+    'INSERT INTO a SELECT * FROM b',
+    'REPLACE INTO users (name) VALUES (?)',
+    'INSERT INTO users (name) VALUES (?) ON DUPLICATE KEY UPDATE name = ?',
+    'UPDATE a JOIN b ON a.id = b.id SET a.x = ? WHERE a.id = ?',
+    'UPDATE a, b SET a.x = ? WHERE a.id = ?',
+    'DELETE a FROM a JOIN b WHERE a.id = ?',
+    'INSERT INTO users (name) VALUES (SLEEP(1))',
+    'UPDATE users SET name = ? WHERE id = ?; DROP TABLE users',
+    'SELECT 1',
+    'SHOW TABLES',
+    'BEGIN',
+    'SET autocommit = 1',
+  ];
+  for (const sql of WRITE_REJECT_CASES) {
+    it(`策略拒绝：${JSON.stringify(sql.slice(0, 50))}`, async () => {
+      const runner = new FakeRunner(() => result([], []));
+      await withClient(
+        runner,
+        async (client, r) => {
+          const outcome = await callTool(client, 'mysql_execute', { sql });
+          expect(outcome.isError).toBe(true);
+          expect(outcome.payload['code']).toBe(ErrorCode.POLICY_REJECTED);
+          // 拒绝发生在执行之前：不应触达写入路径
+          expect(r.writeCalls).toHaveLength(0);
+        },
+        { allowWrite: true },
+      );
+    });
+  }
+
+  it('占位符与参数数量不一致 → PARAM', async () => {
     const runner = new FakeRunner(() => result([], []));
     await withClient(
       runner,
       async (client) => {
         const outcome = await callTool(client, 'mysql_execute', {
           sql: 'UPDATE users SET name = ? WHERE id = ?',
-          params: ['x', 1],
+          params: ['x'],
         });
         expect(outcome.isError).toBe(true);
-        expect(outcome.payload['code']).toBe(ErrorCode.INTERNAL);
+        expect(outcome.payload['code']).toBe(ErrorCode.PARAM);
       },
       { allowWrite: true },
     );
+  });
+
+  it('影响行数超上限回滚 → RESULT_LIMIT', async () => {
+    const runner = new FakeRunner(
+      () => result([], []),
+      () => {
+        throw new ToolError(
+          ErrorCode.RESULT_LIMIT,
+          '写入影响行数超过上限，已回滚',
+          'affectedRows=1001, maxAffectedRows=1000',
+        );
+      },
+    );
+    await withClient(
+      runner,
+      async (client) => {
+        const outcome = await callTool(client, 'mysql_execute', WRITE_OK);
+        expect(outcome.isError).toBe(true);
+        expect(outcome.payload['code']).toBe(ErrorCode.RESULT_LIMIT);
+      },
+      { allowWrite: true },
+    );
+  });
+
+  it('写入语句超时 → TIMEOUT', async () => {
+    const runner = new FakeRunner(
+      () => result([], []),
+      () => {
+        throw Object.assign(new Error('Query inactivity timeout'), {
+          code: 'PROTOCOL_SEQUENCE_TIMEOUT',
+        });
+      },
+    );
+    await withClient(
+      runner,
+      async (client) => {
+        const outcome = await callTool(client, 'mysql_execute', WRITE_OK);
+        expect(outcome.isError).toBe(true);
+        expect(outcome.payload['code']).toBe(ErrorCode.TIMEOUT);
+      },
+      { allowWrite: true },
+    );
+  });
+
+  it('写入连接失败 → CONNECTION', async () => {
+    const runner = new FakeRunner(
+      () => result([], []),
+      () => {
+        throw Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' });
+      },
+    );
+    await withClient(
+      runner,
+      async (client) => {
+        const outcome = await callTool(client, 'mysql_execute', WRITE_OK);
+        expect(outcome.isError).toBe(true);
+        expect(outcome.payload['code']).toBe(ErrorCode.CONNECTION);
+      },
+      { allowWrite: true },
+    );
+  });
+
+  it('空白 SQL → PARAM', async () => {
+    const runner = new FakeRunner(() => result([], []));
+    await withClient(
+      runner,
+      async (client) => {
+        const outcome = await callTool(client, 'mysql_execute', { sql: '  ' });
+        expect(outcome.isError).toBe(true);
+        expect(outcome.payload['code']).toBe(ErrorCode.PARAM);
+      },
+      { allowWrite: true },
+    );
+  });
+
+  it('allowWrite=false 时工具未注册，调用报错', async () => {
+    const runner = new FakeRunner(() => result([], []));
+    await withClient(runner, async (client) => {
+      await expect(
+        callTool(client, 'mysql_execute', WRITE_OK),
+      ).rejects.toThrow();
+    });
   });
 });

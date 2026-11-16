@@ -1,6 +1,6 @@
-/** 测试共享工具：构造最小可用配置与假执行器。 */
+/** 测试共享工具：构造最小可用配置与假执行器（只读 run + 受控写入 runWrite）。 */
 import type { Config } from '../src/config.js';
-import type { SqlRunner, QueryResult } from '../src/pool.js';
+import type { SqlRunner, SqlWriter, QueryResult, ExecuteOutcome } from '../src/pool.js';
 import { createLogger } from '../src/logger.js';
 import type { Logger } from '../src/logger.js';
 
@@ -34,21 +34,45 @@ export function silentLogger(): Logger {
   return createLogger('silent');
 }
 
+/** 受控写入调用记录。 */
+export interface WriteCall {
+  readonly sql: string;
+  readonly params: readonly unknown[];
+  readonly timeoutMs: number;
+  readonly maxAffectedRows: number;
+}
+
 /**
  * 假执行器：可预设结果或按调用抛错，并记录调用参数。
+ * writeRespond 预设写入结果（或抛错）；未预设时调用 runWrite 直接失败，防止意外触达。
  */
-export class FakeRunner implements SqlRunner {
+export class FakeRunner implements SqlRunner, SqlWriter {
   readonly calls: { sql: string; params: readonly unknown[]; timeoutMs: number }[] = [];
+  readonly writeCalls: WriteCall[] = [];
 
   constructor(
     private readonly respond: (
       call: { sql: string; params: readonly unknown[]; timeoutMs: number },
     ) => QueryResult,
+    private readonly writeRespond: (call: WriteCall) => ExecuteOutcome = () => {
+      throw new Error('未预期的 runWrite 调用');
+    },
   ) {}
 
   async run(sql: string, params: readonly unknown[], timeoutMs: number): Promise<QueryResult> {
     this.calls.push({ sql, params, timeoutMs });
     return this.respond({ sql, params, timeoutMs });
+  }
+
+  async runWrite(
+    sql: string,
+    params: readonly unknown[],
+    timeoutMs: number,
+    maxAffectedRows: number,
+  ): Promise<ExecuteOutcome> {
+    const call = { sql, params, timeoutMs, maxAffectedRows };
+    this.writeCalls.push(call);
+    return this.writeRespond(call);
   }
 }
 

@@ -19,7 +19,7 @@ async function main(): Promise<void> {
 
   // 2. 连接池（懒连接）与 Server
   const pool = new MysqlPool(config);
-  const server = createServer({ config, runner: pool, logger });
+  const server = createServer({ config, runner: pool, writer: pool, logger });
   logger.info(
     `mysql-mcp-tool 已启动（stdio 模式，工具集${config.allowWrite ? '含受控写入' : '仅只读'}）`,
   );

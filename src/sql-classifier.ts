@@ -1,8 +1,9 @@
 /**
- * SQL 只读分类器：基于 node-sql-parser 的 AST 分类，叠加危险特征检查。
+ * SQL 分类器：基于 node-sql-parser 的 AST 分类，叠加危险特征检查。
  * 设计要求（docs/tool-contracts-and-security.md 第 6 节）：
  * - 不得用正则/字符串前缀判定语句类别；解析失败或无法确定性分类一律拒绝（fail-closed）。
  * - 多语句、锁定读取、INTO OUTFILE/DUMPFILE、用户变量副作用、危险函数、版本注释均不得绕过。
+ * - classifyQuerySql 服务 mysql_query（只读白名单）；classifyExecuteSql 服务 mysql_execute（受控写入白名单）。
  */
 import * as sqlParser from 'node-sql-parser';
 
@@ -47,6 +48,9 @@ const READ_ONLY_TYPES: ReadonlySet<string> = new Set([
   'explain',
 ]);
 
+/** mysql_execute 允许的顶层语句类别：INSERT / UPDATE / DELETE（REPLACE 为独立 type，被白名单排除）。 */
+const WRITE_TYPES: ReadonlySet<string> = new Set(['insert', 'update', 'delete']);
+
 /** 拒绝名单函数（大小写不敏感；含文件读写与锁副作用）。 */
 const BLACKLISTED_FUNCTIONS: ReadonlySet<string> = new Set([
   'SLEEP',
@@ -70,6 +74,11 @@ function asNode(value: unknown): AstNode | undefined {
     return undefined;
   }
   return value as AstNode;
+}
+
+/** 字段存在性（区分“未出现”与“显式 null”之外的真值）。 */
+function isPresent(value: unknown): boolean {
+  return value !== null && value !== undefined;
 }
 
 /** 深度遍历 AST 全部对象/数组节点，带环保护。 */
@@ -103,54 +112,48 @@ function functionName(node: AstNode): string | undefined {
   return undefined;
 }
 
-/**
- * 对单条 SQL 做只读白名单分类与危险特征检查。
- * 注意：分类结果不要求与外部并发状态一致，同一条 SQL 恒定返回相同结论。
- */
-export function classifyQuerySql(sql: string): QueryClassification {
-  // 标识符占位符 ?? 与 mysql2 文本协议回退路径语义冲突，直接拒绝
-  if (sql.includes('??')) {
-    return { ok: false, reason: '不支持标识符占位符', placeholders: 0 };
-  }
+/** 单语句解析结果：root 缺失时以 reason 说明拒绝原因。 */
+interface ParsedStatement {
+  readonly root?: AstNode;
+  readonly reason?: string;
+}
 
+/** 解析并强制单语句：多语句/空语句/解析失败一律 fail-closed。 */
+function parseSingleStatement(sql: string): ParsedStatement {
   let ast: unknown;
   try {
     ast = parser.astify(expandVersionComments(sql), { database: 'mysql' });
   } catch {
-    return { ok: false, reason: '无法解析为合法 SQL', placeholders: 0 };
+    return { reason: '无法解析为合法 SQL' };
   }
-
   // 数组返回：0=空语句、>1=多语句、1=单语句（尾分号）
   if (Array.isArray(ast)) {
-    if (ast.length === 0) return { ok: false, reason: '空语句', placeholders: 0 };
-    if (ast.length > 1) return { ok: false, reason: '多语句被拒绝', placeholders: 0 };
+    if (ast.length === 0) return { reason: '空语句' };
+    if (ast.length > 1) return { reason: '多语句被拒绝' };
     ast = ast[0];
   }
   const root = asNode(ast);
-  if (!root) return { ok: false, reason: '空语句', placeholders: 0 };
+  if (!root) return { reason: '空语句' };
+  return { root };
+}
 
-  const type = typeof root['type'] === 'string' ? root['type'] : '';
-  if (!READ_ONLY_TYPES.has(type)) {
-    return {
-      ok: false,
-      reason: `语句类别不在只读白名单（${type || '未知'}）`,
-      placeholders: 0,
-    };
-  }
-
-  // 危险特征检查 + 占位符计数（遍历整棵 AST，覆盖子查询/CTE/EXPLAIN 内嵌语句）
+/** 危险特征扫描 + ? 占位符计数（两个分类器共用；覆盖子查询/CTE/SET/VALUES 全部位置）。 */
+function scanDangerFeatures(root: AstNode): {
+  reason?: string;
+  placeholders: number;
+} {
   let placeholders = 0;
   let reason: string | undefined;
   walk(root, (node) => {
     if (reason !== undefined) return;
     const nodeType = typeof node['type'] === 'string' ? node['type'] : '';
     if (nodeType === 'select') {
-      if (node['locking_read'] !== null && node['locking_read'] !== undefined) {
+      if (isPresent(node['locking_read'])) {
         reason = '锁定读取（FOR UPDATE / LOCK IN SHARE MODE）被拒绝';
         return;
       }
       const into = asNode(node['into']);
-      if (into && into['keyword'] !== null && into['keyword'] !== undefined) {
+      if (into && isPresent(into['keyword'])) {
         reason = 'INTO 子句（OUTFILE/DUMPFILE/变量）被拒绝';
         return;
       }
@@ -173,7 +176,124 @@ export function classifyQuerySql(sql: string): QueryClassification {
     }
     if (nodeType === 'origin' && node['value'] === '?') placeholders += 1;
   });
+  return { reason, placeholders };
+}
 
+/** 断言表引用为单表：数组恰好 1 个元素且无 JOIN 标记（拒绝 JOIN/逗号多表）。 */
+function singleTableRef(root: AstNode, key: string): boolean {
+  const refs = root[key];
+  if (!Array.isArray(refs) || refs.length !== 1) return false;
+  const ref = asNode(refs[0]);
+  if (!ref || isPresent(ref['join'])) return false;
+  return true;
+}
+
+/** INSERT 形态检查：仅 INSERT INTO t (cols) VALUES (...)[,(...)]。 */
+function checkInsertShape(root: AstNode): string | undefined {
+  if (isPresent(root['on_duplicate_update'])) {
+    return 'upsert（ON DUPLICATE KEY UPDATE）被拒绝';
+  }
+  const values = asNode(root['values']);
+  if (!values || values['type'] !== 'values' || !Array.isArray(values['values'])) {
+    // INSERT ... SELECT 的 values 为 { type: 'select', ... }，形态不同即拒绝
+    return 'INSERT ... SELECT 被拒绝（仅允许 VALUES 形态）';
+  }
+  // 设计契约 4.2 节：显式列清单是允许形态的一部分（隐式列序依赖表结构，fail-closed 拒绝）
+  if (!Array.isArray(root['columns']) || root['columns'].length === 0) {
+    return 'INSERT 必须显式给出列清单';
+  }
+  if (!singleTableRef(root, 'table')) return '多表写入被拒绝';
+  return undefined;
+}
+
+/** UPDATE 形态检查：单表、必须带 WHERE、不允许 ORDER BY/LIMIT 扩展形态。 */
+function checkUpdateShape(root: AstNode): string | undefined {
+  if (!singleTableRef(root, 'table')) return '多表写入被拒绝';
+  if (!isPresent(root['where'])) return 'UPDATE 必须带 WHERE 条件';
+  if (isPresent(root['orderby']) || isPresent(root['limit'])) {
+    return '仅允许 UPDATE t SET ... WHERE ... 形态（不支持 ORDER BY/LIMIT）';
+  }
+  return undefined;
+}
+
+/** DELETE 形态检查：单表、必须带 WHERE、不允许 ORDER BY/LIMIT 扩展形态。 */
+function checkDeleteShape(root: AstNode): string | undefined {
+  if (!singleTableRef(root, 'from')) return '多表写入被拒绝';
+  if (!isPresent(root['where'])) return 'DELETE 必须带 WHERE 条件';
+  if (isPresent(root['orderby']) || isPresent(root['limit'])) {
+    return '仅允许 DELETE FROM t WHERE ... 形态（不支持 ORDER BY/LIMIT）';
+  }
+  return undefined;
+}
+
+/**
+ * 对单条 SQL 做只读白名单分类与危险特征检查。
+ * 注意：分类结果不要求与外部并发状态一致，同一条 SQL 恒定返回相同结论。
+ */
+export function classifyQuerySql(sql: string): QueryClassification {
+  // 标识符占位符 ?? 与 mysql2 文本协议回退路径语义冲突，直接拒绝
+  if (sql.includes('??')) {
+    return { ok: false, reason: '不支持标识符占位符', placeholders: 0 };
+  }
+
+  const { root, reason: parseReason } = parseSingleStatement(sql);
+  if (!root) {
+    return { ok: false, reason: parseReason ?? '无法解析为合法 SQL', placeholders: 0 };
+  }
+
+  const type = typeof root['type'] === 'string' ? root['type'] : '';
+  if (!READ_ONLY_TYPES.has(type)) {
+    return {
+      ok: false,
+      reason: `语句类别不在只读白名单（${type || '未知'}）`,
+      placeholders: 0,
+    };
+  }
+
+  const { reason, placeholders } = scanDangerFeatures(root);
+  if (reason !== undefined) return { ok: false, reason, placeholders };
+  return { ok: true, placeholders };
+}
+
+/**
+ * 对单条 SQL 做受控写入白名单分类与危险特征检查（mysql_execute 专用）。
+ * 允许形态（设计契约 4.2 节）：INSERT INTO t (cols) VALUES (...)（含多值）、
+ * 带 WHERE 的单表 UPDATE/DELETE；其余一律拒绝（fail-closed）。
+ */
+export function classifyExecuteSql(sql: string): QueryClassification {
+  if (sql.includes('??')) {
+    return { ok: false, reason: '不支持标识符占位符', placeholders: 0 };
+  }
+
+  const { root, reason: parseReason } = parseSingleStatement(sql);
+  if (!root) {
+    return { ok: false, reason: parseReason ?? '无法解析为合法 SQL', placeholders: 0 };
+  }
+
+  const type = typeof root['type'] === 'string' ? root['type'] : '';
+  if (!WRITE_TYPES.has(type)) {
+    return {
+      ok: false,
+      reason: `语句类别不在写入白名单（${type || '未知'}）`,
+      placeholders: 0,
+    };
+  }
+  // WITH（CTE）不在允许写入形态内
+  if (isPresent(root['with'])) {
+    return { ok: false, reason: '写入语句不支持 WITH（CTE）', placeholders: 0 };
+  }
+
+  const shapeReason =
+    type === 'insert'
+      ? checkInsertShape(root)
+      : type === 'update'
+        ? checkUpdateShape(root)
+        : checkDeleteShape(root);
+  if (shapeReason !== undefined) {
+    return { ok: false, reason: shapeReason, placeholders: 0 };
+  }
+
+  const { reason, placeholders } = scanDangerFeatures(root);
   if (reason !== undefined) return { ok: false, reason, placeholders };
   return { ok: true, placeholders };
 }

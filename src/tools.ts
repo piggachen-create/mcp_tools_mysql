@@ -1,7 +1,7 @@
 /**
  * MCP 工具定义与注册。
  * 工具名、输入 Schema 与输出契约见 docs/tool-contracts-and-security.md。
- * M2：4 个只读工具已实现真实逻辑；mysql_execute 仍为占位（M3 实现受控写入）。
+ * M3：5 个工具全部真实实现；mysql_execute 仅 allowWrite=true 时注册，事务化受控写入。
  * 语义错误统一以 isError:true + {code,message,details?} JSON 返回；原始异常只进 stderr 日志。
  */
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -10,9 +10,9 @@ import type { Config } from './config.js';
 import { ErrorCode, ToolError } from './errors.js';
 import { mapMySqlError } from './error-mapper.js';
 import { describeTable, listDatabases, listTables } from './metadata.js';
-import type { SqlRunner } from './pool.js';
+import type { SqlRunner, SqlWriter } from './pool.js';
 import { serializeRows } from './serializer.js';
-import { classifyQuerySql } from './sql-classifier.js';
+import { classifyExecuteSql, classifyQuerySql } from './sql-classifier.js';
 import type { Logger } from './logger.js';
 
 /** 标识符约束：1-128 字符，合法字符集 [a-zA-Z0-9_$]。 */
@@ -25,10 +25,11 @@ const identifier = z
 /** 参数化值仅允许标量。 */
 const scalarParam = z.union([z.string(), z.number(), z.boolean(), z.null()]);
 
-/** 工具层依赖（连接执行器 + 日志 + 全量配置）。 */
+/** 工具层依赖（连接执行器 + 写入执行器 + 日志 + 全量配置）。 */
 export interface ToolServices {
   readonly config: Config;
   readonly runner: SqlRunner;
+  readonly writer: SqlWriter;
   readonly logger: Logger;
 }
 
@@ -64,9 +65,26 @@ function errorResult(error: unknown, logger: Logger, reqId: string): CallResult 
   return { content: [{ type: 'text', text: JSON.stringify(payload) }], isError: true };
 }
 
-/** 在 server 上注册全部工具；mysql_execute 仅在 allowWrite=true 时注册（M3 前为占位）。 */
+/** 策略拒绝结果：恒定脱敏消息 + 分类器给出的具体原因。 */
+function policyResult(reason: string): CallResult {
+  return {
+    content: [
+      {
+        type: 'text' as const,
+        text: JSON.stringify({
+          code: ErrorCode.POLICY_REJECTED,
+          message: '该操作不在允许范围内',
+          details: reason,
+        }),
+      },
+    ],
+    isError: true,
+  };
+}
+
+/** 在 server 上注册全部工具；mysql_execute 仅在 allowWrite=true 时注册。 */
 export function registerTools(server: McpServer, services: ToolServices): void {
-  const { config, runner, logger } = services;
+  const { config, runner, writer, logger } = services;
 
   // 1. 列出当前账号可见的数据库
   server.registerTool(
@@ -202,19 +220,7 @@ export function registerTools(server: McpServer, services: ToolServices): void {
         const classification = classifyQuerySql(trimmed);
         if (!classification.ok) {
           logger.warn(`${reqId} mysql_query 策略拒绝：${classification.reason}`);
-          return {
-            content: [
-              {
-                type: 'text' as const,
-                text: JSON.stringify({
-                  code: ErrorCode.POLICY_REJECTED,
-                  message: '该操作不在允许范围内',
-                  details: classification.reason,
-                }),
-              },
-            ],
-            isError: true,
-          };
+          return policyResult(classification.reason ?? '不允许的操作');
         }
         const boundParams = params ?? [];
         if (boundParams.length !== classification.placeholders) {
@@ -240,7 +246,7 @@ export function registerTools(server: McpServer, services: ToolServices): void {
     },
   );
 
-  // 5. 受控写入：仅 allowWrite=true 时注册；M3 提供真实实现
+  // 5. 受控写入：仅 allowWrite=true 时注册；事务化执行，影响行数超上限自动回滚
   if (config.allowWrite) {
     server.registerTool(
       'mysql_execute',
@@ -261,13 +267,42 @@ export function registerTools(server: McpServer, services: ToolServices): void {
             .describe('与占位符对应的参数值数组，仅允许标量'),
         },
       },
-      async () => {
+      async ({ sql, params }) => {
         const reqId = nextRequestId();
-        return errorResult(
-          new ToolError(ErrorCode.INTERNAL, '受控写入将在 M3 阶段实现'),
-          logger,
-          reqId,
-        );
+        try {
+          const trimmed = sql.trim();
+          if (trimmed === '') {
+            throw new ToolError(ErrorCode.PARAM, 'SQL 不能为空白');
+          }
+          // 策略判定：AST 写入白名单（INSERT/带 WHERE 的 UPDATE/DELETE）+ 危险特征/多语句
+          const classification = classifyExecuteSql(trimmed);
+          if (!classification.ok) {
+            logger.warn(`${reqId} mysql_execute 策略拒绝：${classification.reason}`);
+            return policyResult(classification.reason ?? '不允许的操作');
+          }
+          const boundParams = params ?? [];
+          if (boundParams.length !== classification.placeholders) {
+            throw new ToolError(
+              ErrorCode.PARAM,
+              '占位符与参数数量不一致',
+              `placeholders=${classification.placeholders}, params=${boundParams.length}`,
+            );
+          }
+          const start = Date.now();
+          const outcome = await writer.runWrite(
+            trimmed,
+            boundParams,
+            config.queryTimeoutMs,
+            config.maxAffectedRows,
+          );
+          const durationMs = Date.now() - start;
+          logger.info(
+            `${reqId} mysql_execute 成功：affectedRows=${outcome.affectedRows} changedRows=${outcome.changedRows}，耗时 ${durationMs}ms`,
+          );
+          return jsonResult({ ...outcome, durationMs });
+        } catch (error) {
+          return errorResult(error, logger, reqId);
+        }
       },
     );
   }

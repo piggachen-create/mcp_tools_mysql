@@ -2,8 +2,8 @@
 
 面向 MySQL 的 [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) 服务。本服务通过 MCP 协议，让 AI 客户端以统一、受控的方式探查 MySQL 数据库结构并执行只读查询；仅在显式开启时开放受控写入。
 
-> **当前状态：M2 已完成（只读能力）**
-> M1 交付 stdio 协议骨架与配置 fail-fast；M2 交付连接池、元数据三工具、`mysql_query` 只读查询（AST 白名单分类 + 参数化 + 限行限超时）、序列化与错误映射。受控写入在 M3 交付。
+> **当前状态：M3 已完成（受控写入）**
+> M1 交付 stdio 协议骨架与配置 fail-fast；M2 交付连接池、元数据三工具、`mysql_query` 只读查询（AST 白名单分类 + 参数化 + 限行限超时）、序列化与错误映射；M3 交付 `mysql_execute` 受控写入（条件注册 + AST 写入白名单 + 事务化执行 + 影响行数超限自动回滚）。M4 为发布准备。
 
 ## 项目定位
 
@@ -49,7 +49,7 @@
 
 ## 快速开始
 
-> M2 起只读 4 工具可真实执行查询；受控写入在 M3 交付。
+> M2 起只读 4 工具可真实执行查询；M3 起 `MYSQL_ALLOW_WRITE=true` 时 `mysql_execute` 可执行受控 DML（需可写账号，见 [工具契约·权限矩阵](docs/tool-contracts-and-security.md#7-数据库账号权限矩阵)）。
 
 - 安装依赖：`npm install`
 - 构建：`npm run build`
@@ -69,5 +69,5 @@
 - [x] M0 设计冻结：四份设计文档评审通过
 - [x] M1 协议骨架 & 配置解析
 - [x] M2 只读能力（元数据 + 查询 + 序列化 + 错误映射）
-- [ ] M3 受控写入（条件注册 + 事务化 DML）
+- [x] M3 受控写入（条件注册 + 事务化 DML）
 - [ ] M4 发布准备（打包、README 快速开始、文档定稿）
