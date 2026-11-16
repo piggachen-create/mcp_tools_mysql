@@ -5,6 +5,9 @@ node_modules/
 dist/
 *.tsbuildinfo
 
+# npm 打包产物
+*.tgz
+
 # 测试与覆盖率
 coverage/
 .vitest/
