@@ -6,25 +6,26 @@
 
 | 工具 | 输入 | 输出 | 默认注册 |
 | --- | --- | --- | --- |
-| `mysql_list_databases` | 无 | 数据库名列表 | ✅ |
-| `mysql_list_tables` | `schema`(必填) | 表/视图名列表 | ✅ |
-| `mysql_describe_table` | `table`(必填)，`schema`(可选) | 字段结构 | ✅ |
-| `mysql_query` | `sql`、`params`、`maxRows`、`timeoutMs` | 列元数据 + 行 + 标志位 | ✅ |
-| `mysql_execute` | `sql`、`params` | 影响/变更行数、插入 ID、耗时 | ⛔ 仅开启写入后 |
+| `mysql_list_databases` | `target`(可选) | 数据库名列表 | ✅ |
+| `mysql_list_tables` | `target`(可选)、`schema`(必填) | 表/视图名列表 | ✅ |
+| `mysql_describe_table` | `target`(可选)、`table`(必填)、`schema`(可选) | 字段结构 | ✅ |
+| `mysql_query` | `target`(可选)、`sql`、`params`、`maxRows`、`timeoutMs` | 列元数据 + 行 + 标志位 | ✅ |
+| `mysql_execute` | `target`(可选)、`sql`、`params` | 影响/变更行数、插入 ID、耗时 | ✅ 常注册（按源 `allowWrite` 判定可用性） |
 
 所有工具输出均在 MCP `content[].text` 中以 JSON 字符串返回；执行语义错误通过 `isError: true` + 脱敏消息返回。
 
 **共同约定**
 
+- **`target`（全部工具可选的 `target` 字段）**：指定数据源标识，约束 1–64 字符、字符集 `[a-zA-Z0-9_-]`。缺省时落到服务端 `defaultTarget`（缺省取首 source）；未知 target 返回 `PARAM`（`details.target=...`）。
 - 未知/多余字段：默认拒绝（`additionalProperties: false`），避免调用者注入意外字段。
-- 所有字符串字段做长度上限校验（受 `MYSQL_SQL_MAX_LENGTH` 等服务端限制约束）。
+- 所有字符串字段做长度上限校验（受该源 `sqlMaxLength` 等服务端限制约束）。
 - 调用者不得传入连接凭据、目标库连接串、超范围 `maxRows`、非 `SELECT` 期望的操作。
 
 ## 2. 只读元数据工具
 
 ### 2.1 `mysql_list_databases`
 
-输入 Schema：无（`{}`）。
+输入 Schema：可选 `target`（指定数据源，缺省默认源）。
 
 输出：
 
@@ -48,13 +49,17 @@
 
 ```json
 {
+  "target": "app",
   "schema": "app"
 }
 ```
 
 | 字段 | 类型 | 必填 | 默认 | 约束 |
 | --- | --- | --- | --- | --- |
+| `target` | string | 否 | 默认源 | 1–64 字符，字符集 `[a-zA-Z0-9_-]`；指定数据源 |
 | `schema` | string | 是 | 无 | 1–128 字符，合法标识符字符集 `[a-zA-Z0-9_$]` |
+
+结果行数受该源 `maxRows` 限制，超限截断置 `truncated: true`。
 
 输出：
 
@@ -74,6 +79,7 @@
 
 ```json
 {
+  "target": "app",
   "table": "users",
   "schema": "app"
 }
@@ -81,8 +87,11 @@
 
 | 字段 | 类型 | 必填 | 默认 | 约束 |
 | --- | --- | --- | --- | --- |
+| `target` | string | 否 | 默认源 | 1–64 字符，字符集 `[a-zA-Z0-9_-]`；指定数据源 |
 | `table` | string | 是 | 无 | 1–128 字符合法标识符 |
-| `schema` | string | 否 | 账号默认库 | 存在则 1–128 字符合法标识符；不存在时使用 `MYSQL_DATABASE` |
+| `schema` | string | 否 | 该源默认库 | 存在则 1–128 字符合法标识符；不存在时使用该数据源的 `database` 字段 |
+
+> **注意**：Schema 缺省语义按**目标数据源**的默认库（`DatasourceConfig.database`）取；若该源未配置默认库且未显式传 `schema`，返回 `PARAM`。
 
 输出（列结构取自 `information_schema.COLUMNS` 或 `SHOW COLUMNS`）：
 
@@ -120,6 +129,7 @@
 
 ```json
 {
+  "target": "app",
   "sql": "SELECT id, name, balance FROM users WHERE status = ?",
   "params": [1],
   "maxRows": 100,
@@ -129,12 +139,15 @@
 
 | 字段 | 类型 | 必填 | 默认 | 约束 |
 | --- | --- | --- | --- | --- |
-| `sql` | string | 是 | 无 | 长度 ≤ `MYSQL_SQL_MAX_LENGTH`（默认 16384）；去除首尾空白后非空 |
-| `params` | array | 否 | `[]` | 元素数 ≤ `MYSQL_MAX_PARAMS`（默认 500）；元素仅允许标量类型 |
-| `maxRows` | int | 否 | `MYSQL_MAX_ROWS`(1000) | 1–`MYSQL_MAX_ROWS`，且 ≤ 服务设置上限 |
-| `timeoutMs` | int | 否 | `MYSQL_QUERY_TIMEOUT_MS`(30000) | 100–`MYSQL_QUERY_TIMEOUT_MS`（≤ 服务上限） |
+| `target` | string | 否 | 默认源 | 1–64 字符，字符集 `[a-zA-Z0-9_-]`；指定数据源 |
+| `sql` | string | 是 | 无 | 长度 ≤ 该源 `sqlMaxLength`（默认 16384）；去除首尾空白后非空 |
+| `params` | array | 否 | `[]` | 元素数 ≤ 该源 `maxParams`（默认 500）；元素仅允许标量类型 |
+| `maxRows` | int | 否 | 该源 `maxRows`(1000) | 1–该源 `maxRows`，且 ≤ 源服务设置上限 |
+| `timeoutMs` | int | 否 | 该源 `queryTimeoutMs`(30000) | 100–该源 `queryTimeoutMs`（≤ 源上限） |
 
 **输入校验失败**返回 `PARAM` 错误码（脱敏 details 指明字段）。
+
+**双层校验**：注册期 schema 以全局默认（`global` 合并值，用于 `tools/list` 展示顺序上限）；运行期在 handler 内再按**目标数据源**合并配置二次校验 `sqlMaxLength` / `maxParams` / `maxRows` / `queryTimeoutMs`，超限返回 `PARAM`（details 携带源上限值）。
 
 ### 3.2 执行约束
 
@@ -198,12 +211,13 @@
 
 ## 4. `mysql_execute`（受控写入）
 
-**条件注册**：仅当服务端 `MYSQL_ALLOW_WRITE=true` 时该工具才会出现在工具列表中；默认不注册。写入开关只在启动阶段决定，**运行期无法通过 MCP 请求打开**。
+**常注册 + 按源判定**：本工具**恒定出现在工具列表**（不再依赖全局开关决定是否注册）。运行期 handler 内按**目标数据源**的 `allowWrite` 判定可用性：该源未开启写入（源或 `global` 的 `allowWrite=false`）时返回 `WRITE_DISABLED`。写入可用性可按数据源独立控制，运行期无法通过 MCP 请求打开。
 
 ### 4.1 输入
 
 ```json
 {
+  "target": "write-pool",
   "sql": "UPDATE users SET balance = ? WHERE id = ?",
   "params": [100.00, 42]
 }
@@ -211,8 +225,9 @@
 
 | 字段 | 类型 | 必填 | 默认 | 约束 |
 | --- | --- | --- | --- | --- |
-| `sql` | string | 是 | 无 | 长度 ≤ `MYSQL_SQL_MAX_LENGTH` |
-| `params` | array | 否 | `[]` | 元素数 ≤ `MYSQL_MAX_PARAMS`；仅标量 |
+| `target` | string | 否 | 默认源 | 1–64 字符，字符集 `[a-zA-Z0-9_-]`；指定数据源。该源 `allowWrite=false` 返回 `WRITE_DISABLED` |
+| `sql` | string | 是 | 无 | 长度 ≤ 该源 `sqlMaxLength` |
+| `params` | array | 否 | `[]` | 元素数 ≤ 该源 `maxParams`；仅标量 |
 
 ### 4.2 允许的写入形态
 
@@ -230,13 +245,14 @@
 
 ### 4.3 事务化执行
 
-1. `BEGIN`
-2. 执行参数化语句
-3. 读取影响行数（`affectedRows`）
-4. 若 `affectedRows > MYSQL_MAX_AFFECTED_ROWS`（默认 1000）→ `ROLLBACK`，返回 `RESULT_LIMIT`
-5. 否则 `COMMIT`
+1. 校验目标源 `allowWrite`（未开启 → `WRITE_DISABLED`）
+2. `BEGIN`
+3. 执行参数化语句
+4. 读取影响行数（`affectedRows`）
+5. 若 `affectedRows > 该源 maxAffectedRows`（默认 1000）→ `ROLLBACK`，返回 `RESULT_LIMIT`
+6. 否则 `COMMIT`
 
-任何异常 → `ROLLBACK`，返回对应错误码（连接/超时/策略等）。**绝不部分提交**。
+`maxAffectedRows` 与 `queryTimeoutMs` 均取**目标数据源**合并配置。任何异常 → `ROLLBACK`，返回对应错误码（连接/超时/策略等）。**绝不部分提交**。
 
 ### 4.4 输出
 
@@ -343,7 +359,7 @@ FLUSH PRIVILEGES;
 | `RELOAD` | ⛔ | 禁止服务器级重载 |
 | `SUPER` / `SYSTEM_VARIABLES_ADMIN` | ⛔ | 禁止高权 |
 
-### 7.2 受控写账号（仅 `MYSQL_ALLOW_WRITE=true`）
+### 7.2 受控写账号（仅写入数据源使用）
 
 ```sql
 CREATE USER 'mysql_mcp_rw'@'%' IDENTIFIED BY '<强密码>';
@@ -354,23 +370,34 @@ FLUSH PRIVILEGES;
 
 在只读账号基础上追加受控 DML，**保持其它权限一律禁用**（尤其 `FILE`、`PROCESS`、DDL、`GRANT`）。
 
-### 7.3 账号授权原则
+### 7.3 每源 `allowWrite` 维度
+
+写入能力已从“全局唯一开关”细化为**每数据源可选**（`allowWrite`），账号授权需与各源的 `allowWrite` 对齐：
+
+| 数据源 `allowWrite` | 建议账号 | `mysql_execute` 行为 |
+| --- | --- | --- |
+| `false`（缺省） | 只读账号 `mysql_mcp_ro` | 调用返回 `WRITE_DISABLED` |
+| `true` | 受控写账号 `mysql_mcp_rw` | 允许受控 DML，事务化执行 |
+
+同一配置文件中，各 source 可独立选择只读或可写账号；只读源使用低权限账号，可写源仅在其 `allowWrite=true` 时才配 `mysql_mcp_rw`。
+
+### 7.4 账号授权原则
 
 1. **最小权限**：只授予目标业务库，不授予 `*.*`。
-2. **写账号分离**：可写账号仅在开启写入时使用，并同样限制库范围。
+2. **写账号分离**：可写账号仅在对应数据源 `allowWrite=true` 时使用，并同样限制库范围。
 3. **禁止**：`FILE`、`PROCESS`、用户管理、DDL 权限，以及生产环境使用高权限 `root` 接入。
-4. **只读账号先行**：默认模式必须使用只读账号；不要因为只读模式就把写入权限误授。
-5. 生产环境连接走 TLS，并设置强密码（不落文档、不进日志）。
+4. **只读账号先行**：默认（`allowWrite=false`）数据源必须使用只读账号；不要因为只读模式就把写入权限误授。
+5. 生产环境连接走 TLS，并设置强密码（不落文档、不进日志；密码经 `${VAR}` 环境变量引用传入，明文仅存内存）。
 
 ## 8. 安全边界汇总（纵深防御）
 
 | 层级 | 机制 |
 | --- | --- |
 | 传输/协议 | stdio 专用、stdout 仅协议帧、日志走 stderr |
-| 配置 | 连接凭据仅服务端环境变量、fail-fast、敏感配置不记日志 |
-| 参数校验 | Schema（`additionalProperties:false`）、长度/数量/范围上限 |
+| 配置 | JSON 文件声明多源（`MCP_SOURCES_FILE`）、fail-fast、目标/默认源校验；密码经 `${VAR}` 引用且不记日志 |
+| 参数校验 | Schema（`additionalProperties:false`）、长度/数量/范围上限、每源限制项 |
 | SQL 策略 | AST 分类 + 危险特征 + 多语句/注释处理 + 黑名单 |
-| 工具隔离 | 默认无写入工具、写入开关仅启动时决定 |
+| 工具隔离 | 只读/写入能力按**每数据源 `allowWrite`** 隔离；写入工具恒定注册但按源判定 |
 | 执行限制 | 查询超时、最大行数截断、写入影响行数上限、事务回滚 |
 | 数据库权限 | 最小权限账号兜底（真正安全边界） |
-| 日志脱敏 | 密码/完整 SQL 不落日志、关联 ID 排查 |
+| 日志脱敏 | 密码（含 `${VAR}` 展开明文）/完整 SQL 不落日志、关联 ID 排查 |
