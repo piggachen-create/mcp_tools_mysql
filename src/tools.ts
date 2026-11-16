@@ -1,11 +1,19 @@
 /**
  * MCP 工具定义与注册。
- * 工具名、输入 Schema 与设计文档 docs/tool-contracts-and-security.md 保持一致。
- * M1 阶段：工具已注册、tools/list 可见；工具处理逻辑在 M2（只读）/M3（受控写入）实现。
+ * 工具名、输入 Schema 与输出契约见 docs/tool-contracts-and-security.md。
+ * M2：4 个只读工具已实现真实逻辑；mysql_execute 仍为占位（M3 实现受控写入）。
+ * 语义错误统一以 isError:true + {code,message,details?} JSON 返回；原始异常只进 stderr 日志。
  */
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { ErrorCode } from './errors.js';
+import type { Config } from './config.js';
+import { ErrorCode, ToolError } from './errors.js';
+import { mapMySqlError } from './error-mapper.js';
+import { describeTable, listDatabases, listTables } from './metadata.js';
+import type { SqlRunner } from './pool.js';
+import { serializeRows } from './serializer.js';
+import { classifyQuerySql } from './sql-classifier.js';
+import type { Logger } from './logger.js';
 
 /** 标识符约束：1-128 字符，合法字符集 [a-zA-Z0-9_$]。 */
 const identifier = z
@@ -17,33 +25,49 @@ const identifier = z
 /** 参数化值仅允许标量。 */
 const scalarParam = z.union([z.string(), z.number(), z.boolean(), z.null()]);
 
-/** 工具注册所需的服务端配置子集。 */
-export interface ToolConfig {
-  readonly sqlMaxLength: number;
-  readonly maxParams: number;
-  readonly maxRows: number;
-  readonly queryTimeoutMs: number;
-  readonly allowWrite: boolean;
+/** 工具层依赖（连接执行器 + 日志 + 全量配置）。 */
+export interface ToolServices {
+  readonly config: Config;
+  readonly runner: SqlRunner;
+  readonly logger: Logger;
 }
 
-/** M1 占位处理：统一返回"未实现"，M2/M3 按工具逐一实现。 */
-function notImplemented(toolName: string) {
-  return {
-    content: [
-      {
-        type: 'text' as const,
-        text: JSON.stringify({
-          code: ErrorCode.INTERNAL,
-          message: `工具 ${toolName} 尚未实现（M1 阶段仅提供协议骨架）`,
-        }),
-      },
-    ],
-    isError: true,
-  };
+/** 递增请求关联 ID，日志与错误响应一致携带（docs/architecture.md 第 6 节）。 */
+let requestSeq = 0;
+function nextRequestId(): string {
+  requestSeq += 1;
+  return `req-${requestSeq}`;
 }
 
-/** 在 server 上注册全部工具；mysql_execute 仅在 allowWrite=true 时注册。 */
-export function registerTools(server: McpServer, config: ToolConfig): void {
+type CallResult = {
+  content: { type: 'text'; text: string }[];
+  isError?: boolean;
+};
+
+/** 成功结果：payload 序列化为 content[].text。 */
+function jsonResult(payload: unknown): CallResult {
+  return { content: [{ type: 'text', text: JSON.stringify(payload) }] };
+}
+
+/**
+ * 失败结果：ToolError 携带稳定错误码；其余异常经错误映射。
+ * 客户端只见恒定脱敏消息；原因详情仅进 stderr 日志。
+ */
+function errorResult(error: unknown, logger: Logger, reqId: string): CallResult {
+  const toolError =
+    error instanceof ToolError
+      ? error
+      : mapMySqlError(error, logger);
+  logger.warn(`${reqId} 失败：code=${toolError.code}${toolError.details ? ` details=${toolError.details}` : ''}`);
+  const payload: Record<string, string> = { code: toolError.code, message: toolError.message };
+  if (toolError.details !== undefined) payload['details'] = toolError.details;
+  return { content: [{ type: 'text', text: JSON.stringify(payload) }], isError: true };
+}
+
+/** 在 server 上注册全部工具；mysql_execute 仅在 allowWrite=true 时注册（M3 前为占位）。 */
+export function registerTools(server: McpServer, services: ToolServices): void {
+  const { config, runner, logger } = services;
+
   // 1. 列出当前账号可见的数据库
   server.registerTool(
     'mysql_list_databases',
@@ -52,7 +76,21 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
       description: '列出当前 MySQL 账号可见的数据库。',
       inputSchema: {},
     },
-    async () => notImplemented('mysql_list_databases'),
+    async () => {
+      const reqId = nextRequestId();
+      try {
+        const result = await listDatabases(runner, {
+          maxRows: config.maxRows,
+          queryTimeoutMs: config.queryTimeoutMs,
+        });
+        logger.info(
+          `${reqId} mysql_list_databases 成功：${result.databases.length} 项${result.truncated ? '（截断）' : ''}`,
+        );
+        return jsonResult(result);
+      } catch (error) {
+        return errorResult(error, logger, reqId);
+      }
+    },
   );
 
   // 2. 列出指定库下的表与视图
@@ -65,7 +103,21 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
         schema: identifier.describe('目标数据库名（1-128 字符合法标识符）'),
       },
     },
-    async () => notImplemented('mysql_list_tables'),
+    async ({ schema }) => {
+      const reqId = nextRequestId();
+      try {
+        const result = await listTables(runner, {
+          maxRows: config.maxRows,
+          queryTimeoutMs: config.queryTimeoutMs,
+        }, schema);
+        logger.info(
+          `${reqId} mysql_list_tables 成功：schema=${schema} 共 ${result.tables.length} 项${result.truncated ? '（截断）' : ''}`,
+        );
+        return jsonResult(result);
+      } catch (error) {
+        return errorResult(error, logger, reqId);
+      }
+    },
   );
 
   // 3. 描述单表字段结构
@@ -81,10 +133,31 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
           .describe('表所在数据库名，缺省时使用服务端配置的默认库'),
       },
     },
-    async () => notImplemented('mysql_describe_table'),
+    async ({ table, schema }) => {
+      const reqId = nextRequestId();
+      try {
+        const effectiveSchema = schema ?? config.database;
+        if (effectiveSchema === '') {
+          throw new ToolError(
+            ErrorCode.PARAM,
+            '未指定 schema 且服务端未配置默认库',
+          );
+        }
+        const result = await describeTable(runner, {
+          maxRows: config.maxRows,
+          queryTimeoutMs: config.queryTimeoutMs,
+        }, table, effectiveSchema);
+        logger.info(
+          `${reqId} mysql_describe_table 成功：${result.schema}.${result.table} 共 ${result.columns.length} 列`,
+        );
+        return jsonResult(result);
+      } catch (error) {
+        return errorResult(error, logger, reqId);
+      }
+    },
   );
 
-  // 4. 只读查询
+  // 4. 只读查询：AST 分类 → 占位符校验 → 限行限超时执行 → 序列化
   server.registerTool(
     'mysql_query',
     {
@@ -118,10 +191,56 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
           .describe(`查询超时（毫秒），100-${config.queryTimeoutMs}`),
       },
     },
-    async () => notImplemented('mysql_query'),
+    async ({ sql, params, maxRows, timeoutMs }) => {
+      const reqId = nextRequestId();
+      try {
+        const trimmed = sql.trim();
+        if (trimmed === '') {
+          throw new ToolError(ErrorCode.PARAM, 'SQL 不能为空白');
+        }
+        // 策略判定：AST 只读白名单 + 危险特征（锁定读取/文件输出/用户变量/危险函数/多语句）
+        const classification = classifyQuerySql(trimmed);
+        if (!classification.ok) {
+          logger.warn(`${reqId} mysql_query 策略拒绝：${classification.reason}`);
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify({
+                  code: ErrorCode.POLICY_REJECTED,
+                  message: '该操作不在允许范围内',
+                  details: classification.reason,
+                }),
+              },
+            ],
+            isError: true,
+          };
+        }
+        const boundParams = params ?? [];
+        if (boundParams.length !== classification.placeholders) {
+          throw new ToolError(
+            ErrorCode.PARAM,
+            '占位符与参数数量不一致',
+            `placeholders=${classification.placeholders}, params=${boundParams.length}`,
+          );
+        }
+        const effectiveMaxRows = maxRows ?? config.maxRows;
+        const effectiveTimeout = timeoutMs ?? config.queryTimeoutMs;
+        const start = Date.now();
+        const { rows, fields } = await runner.run(trimmed, boundParams, effectiveTimeout);
+        const durationMs = Date.now() - start;
+        const serialized = serializeRows(rows, fields, effectiveMaxRows);
+        logger.info(
+          `${reqId} mysql_query 成功：${serialized.rowCount} 行${serialized.truncated ? '（截断）' : ''}，耗时 ${durationMs}ms`,
+        );
+        return jsonResult({ ...serialized, durationMs });
+      } catch (error) {
+        return errorResult(error, logger, reqId);
+      }
+    },
   );
 
-  // 5. 受控写入：仅 allowWrite=true 时注册
+  // 5. 受控写入：仅 allowWrite=true 时注册；M3 提供真实实现
   if (config.allowWrite) {
     server.registerTool(
       'mysql_execute',
@@ -142,7 +261,14 @@ export function registerTools(server: McpServer, config: ToolConfig): void {
             .describe('与占位符对应的参数值数组，仅允许标量'),
         },
       },
-      async () => notImplemented('mysql_execute'),
+      async () => {
+        const reqId = nextRequestId();
+        return errorResult(
+          new ToolError(ErrorCode.INTERNAL, '受控写入将在 M3 阶段实现'),
+          logger,
+          reqId,
+        );
+      },
     );
   }
 }

@@ -42,3 +42,19 @@ export class ConfigError extends Error {
     this.key = key;
   }
 }
+
+/**
+ * 工具执行语义错误。
+ * message 为面向客户端的恒定脱敏消息；details 仅含脱敏摘要（不含 SQL 正文与凭据）。
+ */
+export class ToolError extends Error {
+  readonly code: ErrorCodeType;
+  readonly details?: string;
+
+  constructor(code: ErrorCodeType, message: string, details?: string) {
+    super(message);
+    this.name = 'ToolError';
+    this.code = code;
+    this.details = details;
+  }
+}

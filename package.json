@@ -21,7 +21,9 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1"
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "mysql2": "^3.24.6",
+    "node-sql-parser": "^5.4.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
