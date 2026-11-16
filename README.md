@@ -2,8 +2,8 @@
 
 面向 MySQL 的 [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) 服务。本服务通过 MCP 协议，让 AI 客户端以统一、受控的方式探查 MySQL 数据库结构并执行只读查询；仅在显式开启时开放受控写入。
 
-> **当前状态：设计阶段（M0）**
-> 本仓库当前仅交付**设计文档**，尚未包含任何实现代码。请在动手实现前先阅读并确认三份设计文档。
+> **当前状态：M4 已完成（发布准备）**
+> M1 交付 stdio 协议骨架与配置 fail-fast；M2 交付连接池、元数据三工具、`mysql_query` 只读查询（AST 白名单分类 + 参数化 + 限行限超时）、序列化与错误映射；M3 交付 `mysql_execute` 受控写入（条件注册 + AST 写入白名单 + 事务化执行 + 影响行数超限自动回滚）；M4 完成打包脚本、快速开始实化、示例授权脚本与文档定稿。
 
 ## 项目定位
 
@@ -47,26 +47,81 @@
 
 建议按上述顺序阅读：先理解整体架构与配置，再核对工具契约与安全策略，最后查看验收标准与路线。
 
-## 快速开始（占位）
+## 快速开始
 
-> 以下为后续实现完成后规划的目录，**当前不可用**，实现阶段将按设计文档落地。
+### 1. 构建与测试
 
-- 安装依赖：`npm install`
-- 构建：`npm run build`
-- 配置环境变量：见 [架构文档·配置项](docs/architecture.md#5-配置体系)
-- 启动（stdio）：将被 MCP 客户端以子进程方式拉起，或按 MCP 客户端配置引入。
+```bash
+npm install        # 安装依赖
+npm run build      # 编译到 dist/（typecheck + 单测：npm run typecheck / npm test）
+```
+
+### 2. 准备低权限数据库账号
+
+服务要求使用低权限账号运行（数据库权限是最终安全边界）：
+
+- 只读模式（默认）：执行 [examples/grant-ro.sql](examples/grant-ro.sql)
+- 受控写入模式：执行 [examples/grant-rw.sql](examples/grant-rw.sql)，并配合 `MYSQL_ALLOW_WRITE=true`
+
+### 3. 配置环境变量
+
+| 环境变量 | 必填 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `MYSQL_HOST` | ✅ | 无 | 主机名/IPv4/IPv6 |
+| `MYSQL_USER` | ✅ | 无 | 数据库账号（建议 `mysql_mcp_ro`） |
+| `MYSQL_PASSWORD` | ✅ | 无 | **禁止出现在任何日志中** |
+| `MYSQL_PORT` | 否 | `3306` | 1–65535 |
+| `MYSQL_DATABASE` | 否 | 空 | 账号默认库 |
+| `MYSQL_ALLOW_WRITE` | 否 | `false` | 仅接受 `true`/`false`；开启后注册 `mysql_execute` |
+| `MYSQL_MAX_ROWS` | 否 | `1000` | 单次查询最大返回行数 |
+| `MYSQL_QUERY_TIMEOUT_MS` | 否 | `30000` | 查询超时上限（100–300000） |
+| `MYSQL_MAX_AFFECTED_ROWS` | 否 | `1000` | 写入影响行数上限，超限自动回滚 |
+
+完整配置项（含 TLS、连接池、SQL 长度等）见 [架构文档·配置体系](docs/architecture.md#5-配置体系)。
+
+### 4. 接入 MCP 客户端（stdio）
+
+以 Claude Desktop（`claude_desktop_config.json`）或 Cursor（`.cursor/mcp.json`）为例，将服务作为子进程拉起：
+
+```json
+{
+  "mcpServers": {
+    "mysql": {
+      "command": "node",
+      "args": ["/absolute/path/to/mysql-mcp-tool/dist/index.js"],
+      "env": {
+        "MYSQL_HOST": "127.0.0.1",
+        "MYSQL_PORT": "3306",
+        "MYSQL_USER": "mysql_mcp_ro",
+        "MYSQL_PASSWORD": "<强密码>",
+        "MYSQL_DATABASE": "app"
+      }
+    }
+  }
+}
+```
+
+如需受控写入，改用可写账号并追加 `"MYSQL_ALLOW_WRITE": "true"`（工具列表中才会出现 `mysql_execute`）。任一配置非法时服务启动即失败退出（fail-fast），错误仅含配置项名、不含值。
+
+### 5. 打包
+
+```bash
+npm pack   # prepack 自动 clean + build，产出只含 dist/docs/examples 的压缩包
+```
+
+`private: true` 防止误发布到 npm registry；如需对外发布，先移除该标记并补充许可证。
 
 ## 许可证
 
-待实现阶段确定后补充。
+待确定（发布到公开 registry 前补充）。
 
 ---
 
 ## 文档任务清单
 
 - [x] 仓库初始化（Gitee 私有空仓库，`main` 默认分支）
-- [ ] M0 设计冻结：四份设计文档评审通过
-- [ ] M1 协议骨架 & 配置解析
-- [ ] M2 只读能力（元数据 + 查询）
-- [ ] M3 受控写入（条件注册 + 事务化 DML）
-- [ ] M4 发布准备（打包、README 快速开始、文档定稿）
+- [x] M0 设计冻结：四份设计文档评审通过
+- [x] M1 协议骨架 & 配置解析
+- [x] M2 只读能力（元数据 + 查询 + 序列化 + 错误映射）
+- [x] M3 受控写入（条件注册 + 事务化 DML）
+- [x] M4 发布准备（打包、README 快速开始、文档定稿）
