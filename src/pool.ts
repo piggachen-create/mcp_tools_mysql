@@ -1,13 +1,15 @@
 /**
- * MySQL 连接池：单数据源、懒创建、进程退出清理。
- * - 池参数来自 Config（poolSize / poolIdleTimeoutMs / connectTimeoutMs）。
+ * MySQL 连接池：单数据源、懒创建、进程退出清理；以及多数据源连接管理器。
+ * - MysqlPool 针对单个已合并数据源配置维护一个 mysql2 池。
+ * - ConnectionManager 按 target 懒建并复用多个 MysqlPool，为工具层按数据源分派执行器。
+ * - 池参数（poolSize/poolIdleTimeoutMs）来自 GlobalConfig（进程级），经构造注入。
  * - multipleStatements:false 防多语句，其余防线见分类器与后端校验。
  * - 查询超时使用 mysql2 timeout 选项；超时后销毁连接，防止脏连接回池。
  * - 受控写入走事务：影响行数超上限自动 ROLLBACK，任何异常统一 ROLLBACK，绝不部分提交。
  * 生命周期约定见 docs/architecture.md 第 4 节；写入语义见 docs/tool-contracts-and-security.md 第 4 节。
  */
 import mysql from 'mysql2/promise';
-import type { Config } from './config.js';
+import type { DatasourceConfig, GlobalConfig } from './config.js';
 import type { FieldInfo } from './serializer.js';
 import { ErrorCode, ToolError } from './errors.js';
 
@@ -121,12 +123,15 @@ export async function executeDmlInTransaction(
 export class MysqlPool implements SqlRunner, SqlWriter {
   private pool?: mysql.Pool;
 
-  constructor(private readonly config: Config) {}
+  constructor(
+    private readonly config: DatasourceConfig,
+    private readonly global: Pick<GlobalConfig, 'poolSize' | 'poolIdleTimeoutMs'>,
+  ) {}
 
   /** 懒创建池：首次执行时建立连接，启动阶段不强制验证连通性。 */
   private getPool(): mysql.Pool {
     if (!this.pool) {
-      const { config } = this;
+      const { config, global } = this;
       this.pool = mysql.createPool({
         host: config.host,
         port: config.port,
@@ -135,9 +140,9 @@ export class MysqlPool implements SqlRunner, SqlWriter {
         database: config.database === '' ? undefined : config.database,
         charset: config.charset,
         connectTimeout: config.connectTimeoutMs,
-        connectionLimit: config.poolSize,
-        maxIdle: config.poolSize,
-        idleTimeout: config.poolIdleTimeoutMs,
+        connectionLimit: global.poolSize,
+        maxIdle: global.poolSize,
+        idleTimeout: global.poolIdleTimeoutMs,
         waitForConnections: true,
         multipleStatements: false,
         // 序列化语义（docs/tool-contracts-and-security.md 第 5 节）
@@ -231,5 +236,65 @@ export class MysqlPool implements SqlRunner, SqlWriter {
       this.pool = undefined;
       await closing.end();
     }
+  }
+}
+
+/**
+ * 多数据源连接管理器：按 target 懒建并复用 MysqlPool，为工具层按数据源分派执行器。
+ * - 未知 target → ToolError(PARAM,...)。
+ * - resolve 首次访问某 target 才创建池；未访问源不占连接。
+ * - endAll 遍历关闭全部池（进程退出清理钩子调用）。
+ * 本类为解析器而非执行器：仅负责按 target 提供 SqlRunner/SqlWriter。
+ */
+export class ConnectionManager {
+  private readonly pools = new Map<string, MysqlPool>();
+
+  constructor(
+    private readonly sources: readonly DatasourceConfig[],
+    private readonly global: Pick<GlobalConfig, 'poolSize' | 'poolIdleTimeoutMs'>,
+    private readonly defaultTarget: string,
+  ) {}
+
+  /** target → 已合并配置；undefined 落到默认源；未知 target 抛 ToolError(PARAM)。 */
+  configFor(target?: string): DatasourceConfig {
+    const resolved = this.resolveTarget(target);
+    const cfg = this.sources.find((s) => s.target === resolved);
+    if (!cfg) {
+      throw new ToolError(ErrorCode.PARAM, '目标数据源不存在', `target=${resolved}`);
+    }
+    return cfg;
+  }
+
+  /** 解析只读执行器：懒建对应 target 的池（MysqlPool 同时实现只读与写入）。 */
+  resolve(target?: string): MysqlPool {
+    const resolved = this.resolveTarget(target);
+    return this.getOrCreate(resolved);
+  }
+
+  /** 解析写执行器：MysqlPool 实现 SqlWriter，与只读共用同一池。 */
+  resolveWriter(target?: string): SqlWriter {
+    return this.resolve(target);
+  }
+
+  /** 遍历并并发关闭所有池，随后清空映射。 */
+  async endAll(): Promise<void> {
+    const pools = [...this.pools.values()];
+    this.pools.clear();
+    await Promise.all(pools.map((p) => p.end()));
+  }
+
+  private resolveTarget(target?: string): string {
+    return target ?? this.defaultTarget;
+  }
+
+  private getOrCreate(target: string): MysqlPool {
+    let pool = this.pools.get(target);
+    if (!pool) {
+      // configFor 已保证 target 存在于 sources
+      const cfg = this.sources.find((s) => s.target === target)!;
+      pool = new MysqlPool(cfg, this.global);
+      this.pools.set(target, pool);
+    }
+    return pool;
   }
 }

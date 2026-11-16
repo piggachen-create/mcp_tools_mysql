@@ -1,0 +1,47 @@
+{
+  "$schema": "./mcp.sources.schema.json",
+  "global": {
+    "poolSize": 5,
+    "poolIdleTimeoutMs": 60000,
+    "queryTimeoutMs": 30000,
+    "maxRows": 1000,
+    "sqlMaxLength": 16384,
+    "maxParams": 500,
+    "maxAffectedRows": 1000,
+    "tls": false,
+    "tlsRejectUnauthorized": true,
+    "allowWrite": false,
+    "logLevel": "info"
+  },
+  "defaultTarget": "app",
+  "sources": [
+    {
+      "target": "app",
+      "host": "127.0.0.1",
+      "port": 3306,
+      "user": "mysql_mcp_ro",
+      "password": "${MYSQL_PASSWORD}",
+      "database": "app"
+    },
+    {
+      "target": "replica",
+      "host": "replica.internal",
+      "port": 3306,
+      "user": "mysql_mcp_ro",
+      "password": "${MYSQL_REPLICA_PASSWORD}",
+      "database": "analytics",
+      "maxRows": 2000,
+      "queryTimeoutMs": 20000
+    },
+    {
+      "target": "write-pool",
+      "host": "127.0.0.1",
+      "port": 3306,
+      "user": "mysql_mcp_rw",
+      "password": "${MYSQL_WRITE_PASSWORD}",
+      "database": "app",
+      "allowWrite": true,
+      "maxAffectedRows": 500
+    }
+  ]
+}
