@@ -1,75 +1,77 @@
 # MySQL MCP Tool
 
-面向 MySQL 的 [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) 服务。本服务通过 MCP 协议，让 AI 客户端以统一、受控的方式探查 MySQL 数据库结构并执行只读查询；写入能力按数据源显式开启。
+A [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server for MySQL. Through the MCP protocol, this service lets AI clients explore MySQL database structure and run read-only queries in a unified, controlled way; write capability is enabled explicitly per data source.
 
-> **当前状态：多数据源版已发布（M4 里程碑完成）**
-> 配置由单个 JSON 文件（`MCP_SOURCES_FILE`）声明**多数据源**（含 `global` 全局默认 `+ sources` 每源覆盖合并）；`ConnectionManager` 按 target 懒建并复用每源连接池；5 个工具恒定注册，`mysql_execute` 按目标数据源 `allowWrite` 判定可用性。已完成 typecheck 与全部单元测试（249/249）。
+> **Current status: multi-data-source release (M4 milestone complete)**
+> Configuration is declared in a single JSON file (`MCP_SOURCES_FILE`) for **multiple data sources** (`global` defaults merged with per-source `sources` overrides); `ConnectionManager` lazily creates and reuses per-target connection pools; all 5 tools are always registered, and `mysql_execute` availability is decided by the target data source's `allowWrite`. Typecheck and the full unit-test suite (249/249) pass.
 
-## 项目定位
+## Project Positioning
 
-- **能力**：通过 MCP 工具向 AI 客户端提供 MySQL 元数据读取（库/表/结构）与受控的多数据库查询能力；各数据源可独立开启受限写入。
-- **技术栈**：Node.js + TypeScript，官方 MCP TypeScript SDK，`mysql2/promise` 驱动。
-- **传输方式**：首版仅支持 `stdio` transport，不设计 HTTP/SSE、多租户或管理后台。
-- **多数据源与按源开关**：一个进程通过 `mcp.sources.json` 声明多个数据源（各以 `target` 标识）；写入能力按**每数据源** `allowWrite` 独立控制，未开启的数据源调用 `mysql_execute` 返回 `WRITE_DISABLED`。
-- **安全边界**：SQL 应用层策略只是纵深防御的第一道；**MySQL 账号权限才是最终安全边界**。服务要求使用低权限数据库账号运行。
+- **Capabilities**: provides AI clients with MySQL metadata reads (databases/tables/schemas) and controlled multi-data-source queries through MCP tools; each data source can independently enable limited writes.
+- **Tech stack**: Node.js + TypeScript, official MCP TypeScript SDK, `mysql2/promise` driver.
+- **Transport**: v1 supports only the `stdio` transport; no HTTP/SSE, multi-tenancy, or admin UI.
+- **Multiple data sources with per-source switches**: a single process declares several data sources via `mcp.sources.json` (each identified by `target`); write capability is controlled per data source via `allowWrite`. Calling `mysql_execute` on a source where writes are disabled returns `WRITE_DISABLED`.
+- **Security boundary**: SQL application-layer policy is the first line of defense-in-depth; **MySQL account permissions are the ultimate security boundary**. The service must run with a low-privilege database account.
 
-## 首版能力
+## v1 Capabilities
 
-| 工具 | 说明 | 默认注册 |
+| Tool | Description | Registered by default |
 | --- | --- | --- |
-| `mysql_list_databases` | 列出指定数据源（缺省默认源）账号可见的数据库 | ✅ |
-| `mysql_list_tables` | 列出指定 Schema 下的表与视图 | ✅ |
-| `mysql_describe_table` | 描述单张表/视图的字段结构 | ✅ |
-| `mysql_query` | 执行只读查询（参数化，限行数、限超时） | ✅ |
-| `mysql_execute` | 在事务中执行受控 DML（仅 `INSERT`、带 `WHERE` 的 `UPDATE`/`DELETE`）；按目标源 `allowWrite` 判定 | ✅ |
+| `mysql_list_databases` | List databases visible to the account of the specified data source (default source if omitted) | ✅ |
+| `mysql_list_tables` | List tables and views under a given schema | ✅ |
+| `mysql_describe_table` | Describe the column structure of a single table/view | ✅ |
+| `mysql_query` | Run a read-only query (parameterized, row-limited, timeout-limited) | ✅ |
+| `mysql_execute` | Run controlled DML in a transaction (only `INSERT`, and `UPDATE`/`DELETE` with a `WHERE`); gated by the target source's `allowWrite` | ✅ |
 
-所有工具输入均含可选 `target` 字段：指定数据源标识，缺省落到默认源（`defaultTarget`，缺省取首 source）。
+All tools accept an optional `target` field: it selects a data source, defaulting to the default source (`defaultTarget`, which falls back to the first `source` when unset).
 
-## 非目标（首版明确不做）
+## Non-Goals (explicitly out of scope for v1)
 
-- DDL、DCL、TCL：`CREATE` / `ALTER` / `DROP` / `GRANT` / `BEGIN` / `COMMIT` 等一律拒绝。
-- 存储过程 / 函数调用（`CALL`）、多语句批处理。
-- 任意数据库切换、事务会话管理、会话级 `USE` 后的跨库自由查询。
-- HTTP/SSE、多租户、Web 管理界面、鉴权体系。
-- 通过 MCP 请求在运行期动态开启/关闭写入能力。
+- DDL / DCL / TCL: `CREATE` / `ALTER` / `DROP` / `GRANT` / `BEGIN` / `COMMIT` are all rejected.
+- Stored procedure / function calls (`CALL`), multi-statement batches.
+- Arbitrary database switching, transaction session management, or free cross-database queries after a session-level `USE`.
+- HTTP/SSE, multi-tenancy, web admin UI, or an authentication framework.
+- Dynamically enabling/disabling write capability at runtime via MCP requests.
 
-## 核心设计约束
+## Core Design Constraints
 
-1. **stdout / stderr 严格分离**：`stdout` 只承载 MCP 协议帧；所有日志与诊断信息写入 `stderr`，并做敏感信息脱敏。
-2. **参数化查询**：`mysql_query` / `mysql_execute` 的 `params` 必须走预编译参数绑定，不允许将调用者输入拼接进 SQL 文本。
-3. **连接凭据不入工具入参**：数据库账号、密码、连接地址等仅由服务端配置提供，调用者无法通过工具参数传入或更改。
-4. **写入事务化**：`mysql_execute` 在事务中执行；影响行数超过上限必须回滚，不做部分提交。
-5. **精确保留数值**：`BIGINT`、`DECIMAL` 等大数值以字符串形式返回，避免精度丢失。
+1. **Strict stdout / stderr separation**: `stdout` carries only MCP protocol frames; all logging and diagnostics go to `stderr`, with sensitive information redacted.
+2. **Parameterized queries**: `params` of `mysql_query` / `mysql_execute` must use prepared parameter binding; caller input is never concatenated into SQL text.
+3. **Credentials never passed as tool arguments**: database account, password, connection address, etc. are provided only by the server configuration; callers cannot pass or alter them through tool parameters.
+4. **Transactional writes**: `mysql_execute` runs within a transaction; if affected rows exceed the limit, it rolls back — no partial commits.
+5. **Exact numeric preservation**: large values such as `BIGINT` and `DECIMAL` are returned as strings to avoid precision loss.
 
-## 设计文档导航
+## Documentation Navigation
 
-- [架构与调用链](docs/architecture.md) —— 请求链路、模块边界、配置体系、错误码模型。
-- [工具契约与安全设计](docs/tool-contracts-and-security.md) —— 5 个工具的输入/输出 Schema、SQL 策略决策表、数据库权限矩阵、序列化语义。
-- [测试矩阵与实施路线](docs/testing-and-roadmap.md) —— 单元/集成/安全回归测试矩阵，以及 M0–M4 阶段目标与退出条件。
+- [Architecture & Call Flow](docs/architecture.md) — request path, module boundaries, configuration system, error-code model.
+- [Tool Contracts & Security Design](docs/tool-contracts-and-security.md) — I/O schemas for the 5 tools, SQL policy decision table, database permission matrix, serialization semantics.
+- [Testing Matrix & Implementation Roadmap](docs/testing-and-roadmap.md) — unit/integration/security regression test matrix, plus M0–M4 phase goals and exit criteria.
 
-建议按上述顺序阅读：先理解整体架构与配置，再核对工具契约与安全策略，最后查看验收标准与路线。
+Reading order is recommended as above: first understand the overall architecture and configuration, then verify tool contracts and security policy, and finally review the acceptance criteria and roadmap.
 
-## 快速开始
+> **中文文档**: 中英文字版见 [README.zh-CN.md](README.zh-CN.md)，文档位于 [docs/](docs/)（英文）与 `docs/*.zh-CN.md`（中文）。
 
-### 1. 构建与测试
+## Quick Start
+
+### 1. Build and Test
 
 ```bash
-npm install        # 安装依赖
-npm run build      # 编译到 dist/（typecheck + 单测：npm run typecheck / npm test）
+npm install        # install dependencies
+npm run build      # compile to dist/ (typecheck + unit tests: npm run typecheck / npm test)
 ```
 
-### 2. 准备低权限数据库账号
+### 2. Prepare Low-Privilege Database Accounts
 
-服务要求使用低权限账号运行（数据库权限是最终安全边界）：
+The service must run with a low-privilege account (database permissions are the ultimate security boundary):
 
-- 只读数据源（`allowWrite=false`）：执行 [examples/grant-ro.sql](examples/grant-ro.sql)
-- 写入数据源（对应 `allowWrite=true`）：执行 [examples/grant-rw.sql](examples/grant-rw.sql)
+- Read-only data source (`allowWrite=false`): run [examples/grant-ro.sql](examples/grant-ro.sql)
+- Write data source (corresponding to `allowWrite=true`): run [examples/grant-rw.sql](examples/grant-rw.sql)
 
-### 3. 编写多数据源配置（mcp.sources.json）
+### 3. Write the Multi-Data-Source Config (mcp.sources.json)
 
-配置由单个 JSON 文件声明，路径由环境变量 `MCP_SOURCES_FILE` 指定（缺省 `./mcp.sources.json`）。顶层结构：`{ global?, defaultTarget?, sources: [...] }`。
+Configuration is declared in a single JSON file, whose path is set by the environment variable `MCP_SOURCES_FILE` (default `./mcp.sources.json`). Top-level structure: `{ global?, defaultTarget?, sources: [...] }`.
 
-参考 [examples/mcp.sources.json](examples/mcp.sources.json) 的多源示例：
+See the multi-source example in [examples/mcp.sources.json](examples/mcp.sources.json):
 
 ```json
 {
@@ -118,26 +120,26 @@ npm run build      # 编译到 dist/（typecheck + 单测：npm run typecheck / 
 }
 ```
 
-**配置要点**
+**Configuration notes**
 
-- **环境变量表**：
+- **Environment variables**:
 
-| 环境变量 | 必填 | 默认值 | 说明 |
+| Environment variable | Required | Default | Description |
 | --- | --- | --- | --- |
-| `MCP_SOURCES_FILE` | 否 | `./mcp.sources.json` | 多数据源 JSON 配置文件路径 |
+| `MCP_SOURCES_FILE` | No | `./mcp.sources.json` | Path to the multi-data-source JSON config file |
 
-- **连接参数**（每 `source` 必填，不得放 `global`）：`target`、`host`、`user`、`password`；可选 `port`(3306)、`database`、`charset`(utf8mb4)。
-- **全局专属字段**（只能放 `global`）：`poolSize`(5)、`poolIdleTimeoutMs`(60000)、`logLevel`(info)。
-- **可覆盖字段**（三层合并 source > global > 内置默认）：`queryTimeoutMs`(30000)、`maxRows`(1000)、`maxAffectedRows`(1000)、`sqlMaxLength`(16384)、`maxParams`(500)、`allowWrite`(false)、`tls`(false)、`tlsRejectUnauthorized`(true)、`connectTimeoutMs`(10000)。
-- **`target` 规则**：非空、1–64 字符、字符集 `[a-zA-Z0-9_-]`、全局唯一；`defaultTarget` 缺省取首 source。
-- **密码 `${VAR}` 引用**：密码字段支持 `${MYSQL_PASSWORD}` 形式引用环境变量，启动时展开；明文仅存内存，**禁止写入任何日志**。
-- 配置非法时服务启动即失败退出（fail-fast），错误仅含配置项名、不含值。
+- **Connection parameters** (required in each `source`, must NOT go in `global`): `target`, `host`, `user`, `password`; optional `port` (3306), `database`, `charset` (utf8mb4).
+- **Global-only fields** (only in `global`): `poolSize` (5), `poolIdleTimeoutMs` (60000), `logLevel` (info).
+- **Overridable fields** (three-level merge: source > global > built-in default): `queryTimeoutMs` (30000), `maxRows` (1000), `maxAffectedRows` (1000), `sqlMaxLength` (16384), `maxParams` (500), `allowWrite` (false), `tls` (false), `tlsRejectUnauthorized` (true), `connectTimeoutMs` (10000).
+- **`target` rules**: non-empty, 1–64 chars, charset `[a-zA-Z0-9_-]`, globally unique; `defaultTarget` falls back to the first `source` when unset.
+- **Password `${VAR}` references**: the password field supports `${MYSQL_PASSWORD}`-style references to environment variables, expanded at startup; the plaintext is kept only in memory and **must never be written to any log**.
+- On invalid config, the service fails fast at startup; errors contain only the config item name, never the value.
 
-完整配置项说明见 [架构文档·配置体系](docs/architecture.md#5-配置体系)。
+See [Architecture · Configuration System](docs/architecture.md#5-configuration-system) for the full list of config items.
 
-### 4. 接入 MCP 客户端（stdio）
+### 4. Connect an MCP Client (stdio)
 
-以 Claude Desktop（`claude_desktop_config.json`）或 Cursor（`.cursor/mcp.json`）为例，将服务作为子进程拉起，并通过 `MCP_SOURCES_FILE` 指定配置文件路径：
+Using Claude Desktop (`claude_desktop_config.json`) or Cursor (`.cursor/mcp.json`) as examples, launch the service as a subprocess and point it to a config file via `MCP_SOURCES_FILE`:
 
 ```json
 {
@@ -147,38 +149,39 @@ npm run build      # 编译到 dist/（typecheck + 单测：npm run typecheck / 
       "args": ["/absolute/path/to/mysql-mcp-tool/dist/index.js"],
       "env": {
         "MCP_SOURCES_FILE": "/absolute/path/to/mysql-mcp-tool/examples/mcp.sources.json",
-        "MYSQL_PASSWORD": "<强密码>",
-        "MYSQL_REPLICA_PASSWORD": "<副本强密码>",
-        "MYSQL_WRITE_PASSWORD": "<写入账号强密码>"
+        "MYSQL_PASSWORD": "<strong password>",
+        "MYSQL_REPLICA_PASSWORD": "<replica strong password>",
+        "MYSQL_WRITE_PASSWORD": "<write-account strong password>"
       }
     }
   }
 }
 ```
 
-- **`target` 说明**：配置中每个数据源以 `target` 标识；调用任意工具时传入可选 `target` 字段指定目标源，缺省落到 `defaultTarget`（例中为 `app`）。例如 `"target": "write-pool"` 即对该可写源执行受控 DML。
-- 写入可用性按**目标源** `allowWrite` 判定：对未开启写入的源（如 `app`）调用 `mysql_execute` 返回 `WRITE_DISABLED`。
-- 任一配置非法时服务启动即失败退出（fail-fast），错误仅含配置项名、不含值。
+- **About `target`**: each data source in the config is identified by `target`; pass the optional `target` field to any tool to select the target source, defaulting to `defaultTarget` (`app` in the example). For example, `"target": "write-pool"` runs controlled DML against that writable source.
+- Write availability is decided by the **target source's** `allowWrite`: calling `mysql_execute` on a source with writes disabled (e.g. `app`) returns `WRITE_DISABLED`.
+- On any invalid config item, the service fails fast at startup; errors contain only the config item name, never the value.
 
-### 5. 打包
+### 5. Packaging
 
 ```bash
-npm pack   # prepack 自动 clean + build，产出只含 dist/docs/examples 的压缩包
+npm pack   # prepack auto-cleans + builds; the tarball contains only dist/docs/examples
 ```
 
-`private: true` 防止误发布到 npm registry；如需对外发布，先移除该标记并补充许可证。
+`private: true` prevents accidental publishing to the npm registry; to publish publicly, remove the flag and add a license first.
 
-## 许可证
+## License
 
-待确定（发布到公开 registry 前补充）。
+To be determined (to be added before publishing to a public registry).
 
 ---
 
-## 文档任务清单
+## Documentation Task Checklist
 
-- [x] 仓库初始化（Gitee 私有空仓库，`main` 默认分支）
-- [x] M0 设计冻结：四份设计文档评审通过
-- [x] M1 协议骨架 & 配置解析
-- [x] M2 只读能力（元数据 + 查询 + 序列化 + 错误映射 + 多源 target 分派）
-- [x] M3 受控写入（常注册 + 按源 `allowWrite` 判定 + 事务化 DML）
-- [x] M4 发布准备（打包、README 快速开始、文档定稿）
+- [x] Repository initialization (Gitee private empty repo, `main` default branch)
+- [x] M0 design freeze: four design documents reviewed and approved
+- [x] M1 protocol skeleton & config parsing
+- [x] M2 read-only capabilities (metadata + query + serialization + error mapping + multi-source target dispatch)
+- [x] M3 controlled writes (always registered + per-source `allowWrite` gating + transactional DML)
+- [x] M4 release preparation (packaging, README quick start, final docs)
+- [x] Bilingual docs: English default + Chinese parallel files (`.zh-CN`)

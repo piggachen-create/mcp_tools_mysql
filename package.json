@@ -1,7 +1,7 @@
 {
   "name": "mysql-mcp-tool",
   "version": "0.1.0",
-  "description": "面向 MySQL 的 Model Context Protocol 服务：只读优先、可选受控写入",
+  "description": "Model Context Protocol server for MySQL: read-only first, optional controlled writes. 面向 MySQL 的 Model Context Protocol 服务：只读优先、可选受控写入",
   "type": "module",
   "private": true,
   "bin": {
