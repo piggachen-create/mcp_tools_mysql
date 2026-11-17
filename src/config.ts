@@ -172,12 +172,16 @@ function parseLogLevel(value: unknown): LogLevel {
   return raw as LogLevel;
 }
 
-/** target 标识：非空、1–64、字符集 [a-zA-Z0-9_-]、全局唯一。 */
+/**
+ * target 标识：非空、1–64、全局唯一。
+ * 字符集为任意 Unicode 字母/数字（含中文等 CJK 字符）+ 下划线/连字符，
+ * 避免真实使用中出现的「运营云AI」这类中文 target 被误拒。
+ */
 function parseTarget(value: unknown): string {
   const target = parseRequiredString('target', value);
-  if (target.length > 64 || !/^[a-zA-Z0-9_-]+$/.test(target)) {
+  if (target.length > 64 || !/^[\p{L}\p{N}_-]+$/u.test(target)) {
     throw new ConfigError(
-      '配置项 target 不合法：仅允许 1-64 位字母、数字、下划线、连字符',
+      '配置项 target 不合法：仅允许 1-64 位字母（含中文）、数字、下划线、连字符',
       'target',
     );
   }

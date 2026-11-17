@@ -16,7 +16,7 @@
 
 **共同约定**
 
-- **`target`（全部工具可选的 `target` 字段）**：指定数据源标识，约束 1–64 字符、字符集 `[a-zA-Z0-9_-]`。缺省时落到服务端 `defaultTarget`（缺省取首 source）；未知 target 返回 `PARAM`（`details.target=...`）。
+- **`target`（全部工具可选的 `target` 字段）**：指定数据源标识，约束 1–64 字符、字符集为任意 Unicode 字母/数字（含中文等 CJK 字符）+ 下划线/连字符。缺省时落到服务端 `defaultTarget`（缺省取首 source）；未知 target 返回 `PARAM`（`details.target=...`）。
 - 未知/多余字段：默认拒绝（`additionalProperties: false`），避免调用者注入意外字段。
 - 所有字符串字段做长度上限校验（受该源 `sqlMaxLength` 等服务端限制约束）。
 - 调用者不得传入连接凭据、目标库连接串、超范围 `maxRows`、非 `SELECT` 期望的操作。
@@ -56,7 +56,7 @@
 
 | 字段 | 类型 | 必填 | 默认 | 约束 |
 | --- | --- | --- | --- | --- |
-| `target` | string | 否 | 默认源 | 1–64 字符，字符集 `[a-zA-Z0-9_-]`；指定数据源 |
+| `target` | string | 否 | 默认源 | 1–64 字符，Unicode 字母/数字（含中文）+ `_`/`-`；指定数据源 |
 | `schema` | string | 是 | 无 | 1–128 字符，合法标识符字符集 `[a-zA-Z0-9_$]` |
 
 结果行数受该源 `maxRows` 限制，超限截断置 `truncated: true`。
@@ -87,7 +87,7 @@
 
 | 字段 | 类型 | 必填 | 默认 | 约束 |
 | --- | --- | --- | --- | --- |
-| `target` | string | 否 | 默认源 | 1–64 字符，字符集 `[a-zA-Z0-9_-]`；指定数据源 |
+| `target` | string | 否 | 默认源 | 1–64 字符，Unicode 字母/数字（含中文）+ `_`/`-`；指定数据源 |
 | `table` | string | 是 | 无 | 1–128 字符合法标识符 |
 | `schema` | string | 否 | 该源默认库 | 存在则 1–128 字符合法标识符；不存在时使用该数据源的 `database` 字段 |
 
@@ -139,7 +139,7 @@
 
 | 字段 | 类型 | 必填 | 默认 | 约束 |
 | --- | --- | --- | --- | --- |
-| `target` | string | 否 | 默认源 | 1–64 字符，字符集 `[a-zA-Z0-9_-]`；指定数据源 |
+| `target` | string | 否 | 默认源 | 1–64 字符，Unicode 字母/数字（含中文）+ `_`/`-`；指定数据源 |
 | `sql` | string | 是 | 无 | 长度 ≤ 该源 `sqlMaxLength`（默认 16384）；去除首尾空白后非空 |
 | `params` | array | 否 | `[]` | 元素数 ≤ 该源 `maxParams`（默认 500）；元素仅允许标量类型 |
 | `maxRows` | int | 否 | 该源 `maxRows`(1000) | 1–该源 `maxRows`，且 ≤ 源服务设置上限 |
@@ -225,7 +225,7 @@
 
 | 字段 | 类型 | 必填 | 默认 | 约束 |
 | --- | --- | --- | --- | --- |
-| `target` | string | 否 | 默认源 | 1–64 字符，字符集 `[a-zA-Z0-9_-]`；指定数据源。该源 `allowWrite=false` 返回 `WRITE_DISABLED` |
+| `target` | string | 否 | 默认源 | 1–64 字符，Unicode 字母/数字（含中文）+ `_`/`-`；指定数据源。该源 `allowWrite=false` 返回 `WRITE_DISABLED` |
 | `sql` | string | 是 | 无 | 长度 ≤ 该源 `sqlMaxLength` |
 | `params` | array | 否 | `[]` | 元素数 ≤ 该源 `maxParams`；仅标量 |
 

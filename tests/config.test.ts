@@ -144,7 +144,7 @@ describe('多源配置解析：fail-fast 用例', () => {
     expect(() => loadSourcesConfig({ file })).toThrow(ConfigError);
   });
 
-  it.each(['bad target!', 'a/b', 'toolong-' + 'a'.repeat(70), '反引号`'])(
+  it.each(['bad target!', 'a/b', 'toolong-' + 'a'.repeat(70), 'a`b', '运营,AI'])(
     '非法 target 字符/长度 %s 时 fail-fast',
     (target) => {
       const file = tempFile(
@@ -153,6 +153,13 @@ describe('多源配置解析：fail-fast 用例', () => {
       expect(() => loadSourcesConfig({ file })).toThrow(ConfigError);
     },
   );
+
+  it('合法 target 允许中文/CJK 字符', () => {
+    const file = tempFile(
+      json({ sources: [{ target: '运营云AI', host: 'h', user: 'u', password: 'p' }] }),
+    );
+    expect(loadSourcesConfig({ file }).sources[0].target).toBe('运营云AI');
+  });
 
   it('合法 target（含下划线/连字符/数字）可解析', () => {
     const file = tempFile(
